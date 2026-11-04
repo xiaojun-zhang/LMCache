@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union, cast
 
 # Third Party
 import torch
@@ -12,13 +12,23 @@ from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterf
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
+from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
 from lmcache.v1.gpu_connector.utils import (
+    DiscoverableKVCache,
+    LayoutHints,
     assert_is_vllm_flash_attn_or_flash_infer,
     get_block_size,
+    get_device,
+    get_dtype,
     get_elements_per_layer,
+    get_group_data_ptrs,
+    get_head_size,
+    get_hidden_dim_size,
     get_num_blocks,
+    get_num_layers,
     get_tokens_per_layer,
     normalize_kv_and_discover_format,
+    resolve_block_stride,
 )
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -32,14 +42,13 @@ logger = init_logger(__name__)
 
 
 class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
-    """
-    The GPU KV cache should be a nested tuple of K and V tensors.
-    More specifically, we have:
-    - GPUTensor = Tuple[KVLayer, ...]
-    - KVLayer = Tuple[Tensor, Tensor]
-    - Tensor: [num_blocks, block_size, num_heads, head_size]
+    """Transfer paged XPU caches using V2's component-major LMCache storage.
 
-    It will produce / consume memory object with KV_2LTD format
+    Non-MLA objects remain ``[2, L, T, NH * HS]`` / ``KV_2LTD``, including
+    engines whose trailing head row packs K and V into ``CS = 2 * HS``.
+    Packed NHD/HND views may have dim-0 block padding, with the same geometry,
+    dtype and physical block stride across layers. Legacy NHD and MLA views
+    retain their tight-layout transfer contracts.
     """
 
     def __init__(
@@ -47,13 +56,21 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         hidden_dim_size: int,
         num_layers: int,
         use_gpu: bool = False,
-        **kwargs,
-    ):
-        """
-        If use_gpu is true, it will create a gpu intermediate buffer. In this
-        case, it requires the following kwargs:
-        - chunk_size: The MAX size of the chunk to be copied to GPU.
-        - dtype: The data type of the intermediate buffer.
+        **kwargs: object,
+    ) -> None:
+        """Construct a V2 connector without initializing a layout group manager.
+
+        Args:
+            hidden_dim_size: Elements in one flattened K or V token row.
+            num_layers: Number of engine layers.
+            use_gpu: Whether to stage complete stores through an XPU buffer.
+            **kwargs: ``use_mla`` (bool), ``layout_hints`` (LayoutHints), and
+                optional model ``head_size`` (component width). Staging requires
+                ``chunk_size`` (int), ``dtype`` (torch.dtype) and ``device``
+                (torch.device).
+
+        Raises:
+            ValueError: Staging geometry, dtype or device is missing.
         """
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
@@ -65,21 +82,21 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
         self.page_buffer_size = 0
 
-        self.kvcaches: Optional[List[torch.Tensor]] = None
+        self.kvcaches: DiscoverableKVCache | None = None
 
         self.gpu_buffer: Optional[torch.Tensor] = None
-        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.use_mla = bool(kwargs.get("use_mla", False))
+        self.layout_hints = cast(LayoutHints, kwargs.get("layout_hints") or {})
+        self.model_head_size = cast(int | None, kwargs.get("head_size"))
+        self.dtype = cast(torch.dtype | None, kwargs.get("dtype"))
         if use_gpu:
-            assert "chunk_size" in kwargs, (
-                "chunk_size should be provided to create a GPU buffer."
-            )
-            assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
-            assert "device" in kwargs, (
-                "device should be provided to create a GPU buffer."
-            )
-            shape = self.get_shape(kwargs["chunk_size"])
+            if not all(name in kwargs for name in ("chunk_size", "dtype", "device")):
+                raise ValueError("Staging requires chunk_size, dtype and device.")
+            if self.dtype is None or kwargs["device"] is None:
+                raise ValueError("Staging requires a dtype and an XPU device.")
+            shape = self.get_shape(cast(int, kwargs["chunk_size"]))
             self.gpu_buffer = torch.empty(
-                shape, dtype=kwargs["dtype"], device=kwargs["device"]
+                shape, dtype=self.dtype, device=cast(torch.device, kwargs["device"])
             )
 
         self.store_stream = torch.xpu.Stream()
@@ -91,6 +108,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         metadata: "LMCacheMetadata",
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
+        layout_hints: LayoutHints | None = None,
     ) -> "VLLMPagedMemXPUConnectorV2":
         """Create a connector from LMCacheMetadata.
 
@@ -98,6 +116,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
             metadata: The LMCache engine metadata containing model configuration.
             use_gpu: Whether to use GPU intermediate buffer.
             device: The device to use for the connector.
+            layout_hints: Physical NHD/HND or blocks-first layout hints.
 
         Returns:
             A new instance of VLLMPagedMemXPUConnectorV2.
@@ -118,54 +137,37 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
             dtype=metadata.kv_dtype,
             device=device,
             use_mla=metadata.use_mla,
+            head_size=head_size,
+            layout_hints=layout_hints,
         )
-
-    def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
-        self.device = kv_caches[0].device
-        assert self.device.type == "xpu", "The device should be XPU."
-        idx = self.device.index
-        if idx in self.kv_cache_pointers_on_gpu:
-            return self.kv_cache_pointers_on_gpu[idx]
-        self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
-        self.kv_cache_pointers_on_gpu[idx] = torch.empty(
-            self.num_layers, dtype=torch.uint64, device=self.device
-        )
-        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
-
-        self.engine_kv_format, kv_caches = normalize_kv_and_discover_format(
-            kv_caches, EngineType.VLLM
-        )
-        self.num_blocks = get_num_blocks(kv_caches, self.engine_kv_format)
-        self.block_size = get_block_size(kv_caches, self.engine_kv_format)
-        self.page_buffer_size = self.num_blocks * self.block_size
-
-        return self.kv_cache_pointers_on_gpu[idx]
 
     @_lmcache_nvtx_annotate
-    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
+    def to_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Restore one component-major chunk into the engine cache.
+
+        Args:
+            memory_obj: Contiguous V2 chunk, with the engine dtype.
+            start: First token in the full sequence's slot mapping.
+            end: Exclusive last token.
+            **kwargs: ``kvcaches`` (DiscoverableKVCache), ``slot_mapping``
+                (1-D XPU int64 Tensor for the full sequence), and optional
+                ``vllm_cached_tokens`` (int). Negative slots and the cached
+                prefix are left untouched.
+
+        Raises:
+            ValueError: Cache geometry, chunk shape, format or mapping is invalid.
 
         Note:
-          1. This function expects the 'slot_mapping' is a "full slot mapping"
-             where it's length is the same as the whole token sequence.
-          2. In the case that there is prefix caching, slot_mapping will starts
-             with -1s until the end of the matched prefix. The start and end
-             should NEVER overlap with the prefix caching (which means the
-             underlying XPU kernel will never see -1 in slot_mapping)
-
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-        :raises AssertionError: If the memory object does not have a tensor.
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+            Enqueues on the current XPU stream. Batched retrieval owns load
+            stream ordering and synchronization.
         """
-        assert memory_obj.tensor is not None
-
         self.initialize_kvcaches_ptr(**kwargs)
-
-        assert self.kvcaches is not None, (
-            "kvcaches should be provided in kwargs or initialized beforehand."
-        )
+        if self.kvcaches is None:
+            raise ValueError("'kvcaches' must be provided before transfer.")
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        tensor, slot_mapping = self._validate_transfer(memory_obj, start, end, kwargs)
 
         if self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
@@ -180,93 +182,89 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
                     " order to be processed by VLLMPagedMemXPUConnector"
                 )
 
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
-
         # avoid read/write stream race condition for shared block
         # this will only be potentially non-zero for the first
         # block lmcache is transferring back
-        vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+        vllm_cached = cast(int, kwargs.get("vllm_cached_tokens", 0))
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
         device_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
+            tensor,
             kv_cache_pointers,
             slot_mapping[start:end],
             self.device,
             self.page_buffer_size,
             lmcache_native.TransferDirection.H2D,
             self.engine_kv_format,
-            self.block_size,
-            skip_prefix_n_tokens,
+            block_size=self.block_size,
+            head_size=self.head_size,
+            skip_prefix_n_tokens=skip_prefix_n_tokens,
+            block_stride_elems=self.block_stride_elems,
         )
 
     @_lmcache_nvtx_annotate
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
+    def from_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Store engine KV into a V2 chunk, preserving negative-slot rows.
 
-        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+        Args:
+            memory_obj: Contiguous destination with shape from ``get_shape``.
+            start: First token in the full sequence's slot mapping.
+            end: Exclusive last token.
+            **kwargs: ``kvcaches`` (DiscoverableKVCache) and ``slot_mapping``
+                (1-D XPU int64 Tensor for the full sequence).
+
+        Raises:
+            ValueError: Cache geometry, chunk shape or mapping is invalid.
 
         Note:
-          1. This function expects the 'slot_mapping' is a "full slot mapping"
-             where it's length is the same as the whole token sequence.
-          2. In the case that there is prefix caching, slot_mapping will starts
-             with -1s until the end of the matched prefix. The start and end
-             should NEVER overlap with the prefix caching (which means the
-             underlying XPU kernel will never see -1 in slot_mapping)
-
-        :raises ValueError: If 'kvcaches' is not provided in kwargs,
-        :raises AssertionError: If the memory object does not have a tensor.
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+            CPU destinations synchronize the store stream before returning.
+            Packed KV is unpacked on XPU into the existing two-plane storage;
+            metadata's group manager is not initialized by this connector.
         """
-        assert memory_obj.tensor is not None
-
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
-            "kvcaches should be provided in kwargs or initialized beforehand."
-        )
-
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
+        if self.kvcaches is None:
+            raise ValueError("'kvcaches' must be provided before transfer.")
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        tensor, slot_mapping = self._validate_transfer(memory_obj, start, end, kwargs)
 
         with torch.xpu.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 device_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
+                    tensor,
                     kv_cache_pointers,
                     slot_mapping[start:end],
-                    self.kvcaches[0].device,
+                    self.device,
                     self.page_buffer_size,
                     lmcache_native.TransferDirection.D2H,
                     self.engine_kv_format,
-                    self.block_size,
+                    block_size=self.block_size,
+                    head_size=self.head_size,
+                    block_stride_elems=self.block_stride_elems,
                 )
             else:
                 # kvcaches -> gpu_buffer -> memobj
-                assert self.gpu_buffer.device == self.kvcaches[0].device
+                assert self.gpu_buffer.device == self.device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                # The kernel leaves negative slots unchanged. Seed staging
+                # with the destination so reused buffers preserve those rows.
+                tmp_gpu_buffer.copy_(tensor, non_blocking=True)
                 device_ops.multi_layer_kv_transfer(
                     tmp_gpu_buffer,
                     kv_cache_pointers,
                     slot_mapping[start:end],
-                    self.kvcaches[0].device,
+                    self.device,
                     self.page_buffer_size,
                     lmcache_native.TransferDirection.D2H,
                     self.engine_kv_format,
-                    self.block_size,
+                    block_size=self.block_size,
+                    head_size=self.head_size,
+                    block_stride_elems=self.block_stride_elems,
                 )
-                memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+                tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.tensor.is_xpu:
+        if not tensor.is_xpu:
             # Force a synchronize if the target buffer is NOT XPU device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
@@ -274,22 +272,187 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
 
     # TODO(Jiayi): need to optimize to enable real batching
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_to_gpu(
+        self,
+        memory_objs: list[list[MemoryObj]] | list[MemoryObj] | list[int] | None = None,
+        starts: list[int] | None = None,
+        ends: list[int] | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Restore chunks on the load stream and wait for completion.
+
+        Args:
+            memory_objs: Source chunks, one per token range.
+            starts: Inclusive sequence offsets.
+            ends: Exclusive sequence offsets.
+            **kwargs: Cache, slot mapping and cached-prefix arguments of ``to_gpu``.
+
+        Raises:
+            ValueError: Any chunk or range list is absent.
+        """
+        if memory_objs is None or starts is None or ends is None:
+            raise ValueError("V2 batched retrieval requires chunks, starts and ends.")
         with torch.xpu.stream(self.load_stream):
-            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            for memory_obj, start, end in zip(
+                cast(list[MemoryObj], memory_objs), starts, ends, strict=True
+            ):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
 
     # TODO(Jiayi): need to optimize to enable real batching
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+    def batched_from_gpu(
+        self,
+        memory_objs: list[list[MemoryObj]] | list[MemoryObj],
+        starts: list[int],
+        ends: list[int],
+        **kwargs: object,
+    ) -> None:
+        """Store chunks using the synchronization contract of ``from_gpu``.
+
+        Args:
+            memory_objs: Destination chunks, one per token range.
+            starts: Inclusive sequence offsets.
+            ends: Exclusive sequence offsets.
+            **kwargs: Cache and slot mapping arguments of ``from_gpu``.
+        """
+        for memory_obj, start, end in zip(
+            cast(list[MemoryObj], memory_objs), starts, ends, strict=True
+        ):
             self.from_gpu(memory_obj, start, end, **kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
+        """Return V2's ``[components, layers, tokens, NH * HS]`` chunk shape.
+
+        Args:
+            num_tokens: Number of tokens in this chunk.
+
+        Returns:
+            One component for MLA, otherwise separate K and V planes.
+        """
         kv_size = 1 if self.use_mla else 2
         return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
+
+    def _initialize_pointers(self, kv_caches: DiscoverableKVCache) -> torch.Tensor:
+        """Discover and validate engine geometry before publishing layer pointers."""
+        self.device = get_device(kv_caches)
+        if self.device.type != "xpu":
+            raise ValueError("The engine cache must be on XPU.")
+        idx = self.device.index
+        if idx in self.kv_cache_pointers_on_gpu:
+            return self.kv_cache_pointers_on_gpu[idx]
+
+        self.engine_kv_format, self.kvcaches = normalize_kv_and_discover_format(
+            kv_caches, EngineType.VLLM, self.layout_hints
+        )
+        fmt = self.engine_kv_format
+        facts = get_spec_class(fmt)
+        if facts.is_mla != self.use_mla:
+            raise ValueError("Engine MLA layout does not match model metadata.")
+        if get_num_layers(self.kvcaches, fmt) != self.num_layers:
+            raise ValueError("Engine layer count does not match model metadata.")
+        self.num_blocks = get_num_blocks(self.kvcaches, fmt)
+        self.block_size = get_block_size(self.kvcaches, fmt)
+        self.page_buffer_size = self.num_blocks * self.block_size
+        strides = []
+        for layer in range(self.num_layers):
+            if facts.is_fused_packed:
+                layer_caches: DiscoverableKVCache = [
+                    cast(list[torch.Tensor], self.kvcaches)[layer]
+                ]
+                if (
+                    get_device(layer_caches) != self.device
+                    or get_num_blocks(layer_caches, fmt) != self.num_blocks
+                ):
+                    raise ValueError(
+                        "V2 packed layers must share block count and XPU device."
+                    )
+            content_size = get_head_size(self.kvcaches, fmt, layer)
+            if facts.is_fused_packed and content_size % 2:
+                raise ValueError("Packed content size must be twice component HS.")
+            # Shared packed specs describe CS, while V2 stores one K/V
+            # component per plane and passes component HS to SYCL.
+            component_size = (
+                content_size // 2 if facts.is_fused_packed else content_size
+            )
+            if layer == 0:
+                self.head_size = component_size
+            hidden_dim = get_hidden_dim_size(self.kvcaches, fmt, layer)
+            if facts.is_fused_packed:
+                hidden_dim //= 2
+            if (
+                hidden_dim != self.hidden_dim_size
+                or component_size != self.head_size
+                or (
+                    self.model_head_size is not None
+                    and component_size != self.model_head_size
+                )
+                or get_block_size(self.kvcaches, fmt, layer) != self.block_size
+            ):
+                raise ValueError(
+                    "V2 requires uniform geometry matching model metadata."
+                )
+            dtype = get_dtype(self.kvcaches, fmt, layer)
+            if self.dtype is not None and dtype != self.dtype:
+                raise ValueError("Engine dtype does not match V2 model metadata.")
+            self.dtype = dtype
+            stride = resolve_block_stride(self.kvcaches, fmt, layer)
+            if facts.is_fused_packed:
+                strides.append(stride)
+            elif stride is not None and stride != self.block_size * hidden_dim:
+                raise ValueError(
+                    "V2 supports block padding only for packed KV layouts."
+                )
+        if facts.is_fused_packed:
+            if len(set(strides)) != 1:
+                raise ValueError(
+                    "V2 requires the same packed block stride in every layer."
+                )
+            self.block_stride_elems = cast(int, strides[0])
+        else:
+            self.block_stride_elems = 0
+        pointers = get_group_data_ptrs(self.kvcaches, fmt, list(range(self.num_layers)))
+        self.kv_cache_pointers = torch.tensor(
+            pointers, dtype=torch.uint64, device="cpu"
+        )
+        self.kv_cache_pointers_on_gpu[idx] = torch.empty(
+            len(pointers), dtype=torch.uint64, device=self.device
+        )
+        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
+        return self.kv_cache_pointers_on_gpu[idx]
+
+    def _validate_transfer(
+        self, memory_obj: MemoryObj, start: int, end: int, kwargs: dict[str, object]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Validate host-visible geometry without reading device slot values."""
+        tensor = memory_obj.tensor
+        if tensor is None:
+            raise ValueError("The memory object must contain a tensor.")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' must be provided.")
+        slot_mapping = cast(torch.Tensor, kwargs["slot_mapping"])
+        if (
+            slot_mapping.ndim != 1
+            or slot_mapping.dtype != torch.int64
+            or slot_mapping.device != self.device
+            or not slot_mapping.is_contiguous()
+            or not 0 <= start <= end <= slot_mapping.numel()
+        ):
+            raise ValueError(
+                "Expected a contiguous XPU int64 slot mapping and valid range."
+            )
+        if (
+            tensor.shape != self.get_shape(end - start)
+            or not tensor.is_contiguous()
+            or tensor.dtype != self.dtype
+        ):
+            raise ValueError(
+                "Chunk shape, contiguity and dtype must match V2 geometry."
+            )
+        return tensor, slot_mapping
 
 
 class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
@@ -369,7 +532,23 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         logger.info("init kv cache pointers success in VLLMPagedMemXPUConnectorV3")
 
     @_lmcache_nvtx_annotate
-    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+    def to_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Restore initialized V3 groups while preserving the cached prefix.
+
+        Args:
+            memory_obj: Source memory object containing the initialized groups.
+            start: Inclusive token offset in the full slot mapping.
+            end: Exclusive token offset.
+            **kwargs: ``kvcaches`` (list[Tensor]), ``slot_mapping`` (Tensor),
+                and optional ``vllm_cached_tokens`` (int).
+
+        Note:
+            Uses named native skip arguments and leaves legacy head geometry
+            unused. Group initialization and representation follow V3's
+            existing requirements.
+        """
         assert memory_obj.raw_tensor is not None
         assert "slot_mapping" in kwargs
         if self.use_mla:
@@ -377,7 +556,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         else:
             assert memory_obj.metadata.fmt == MemoryFormat.KV_2LTD
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping = cast(torch.Tensor, kwargs["slot_mapping"])
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None
         assert self.kvcaches[0].device == self.device
@@ -387,7 +566,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         # avoid read/write stream race condition for shared block
         # this will only be potentially non-zero for the first
         # block lmcache is transferring back
-        vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+        vllm_cached = cast(int, kwargs.get("vllm_cached_tokens", 0))
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
@@ -402,7 +581,8 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
                 lmcache_native.TransferDirection.H2D,
                 self.engine_kv_format,
                 self.block_size,
-                skip_prefix_n_tokens,
+                head_size=0,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
             )
 
     @_lmcache_nvtx_annotate

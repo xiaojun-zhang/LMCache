@@ -294,6 +294,127 @@ void submit_multi_layer_kernel_fused_kv(
       });
 }
 
+/**
+ * Unpack/pack engine K/V per head while retaining V2's two LMCache planes.
+ *
+ * Unit divides the component width and block stride. Engine base addresses
+ * are read on device, so a normalized view's storage offset may still make a
+ * wide access unaligned. In that case copy the same unit as individual bytes,
+ * avoiding pointer-array readback or an extra synchronization.
+ */
+template <typename Unit, bool D2H, EngineKVFormat format>
+void submit_multi_layer_kernel_packed(
+    sycl::queue& queue, uint8_t* key_value_ptr,
+    const uintptr_t* page_buffer_ptrs, const int64_t* slot_mapping_ptr,
+    size_t row_bytes, size_t head_bytes, size_t block_stride_bytes,
+    int num_tokens, int num_layers, int block_size, int skip_prefix_n_tokens) {
+  const int transfer_tokens = num_tokens - skip_prefix_n_tokens;
+  if (transfer_tokens <= 0) return;
+  const size_t row_units = row_bytes / sizeof(Unit);
+  const size_t head_units = head_bytes / sizeof(Unit);
+  const size_t num_heads = row_bytes / head_bytes;
+  const int wg_size =
+      round_up_to_sg(std::min(row_units, static_cast<size_t>(MAX_WG_SIZE)));
+  queue.parallel_for(
+      sycl::nd_range<3>(
+          sycl::range<3>(1, num_layers,
+                         static_cast<size_t>(transfer_tokens) * wg_size),
+          sycl::range<3>(1, 1, wg_size)),
+      [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+        const size_t layer = item.get_group(1);
+        const size_t token = item.get_group(2) + skip_prefix_n_tokens;
+        const int64_t slot = slot_mapping_ptr[token];
+        if (slot < 0) return;
+        auto* engine = reinterpret_cast<uint8_t*>(page_buffer_ptrs[layer]);
+        const size_t block = slot / block_size;
+        const size_t block_token = slot % block_size;
+        const size_t lmc_key_base = (layer * num_tokens + token) * row_bytes;
+        const size_t lmc_value_base =
+            lmc_key_base +
+            static_cast<size_t>(num_layers) * num_tokens * row_bytes;
+        const size_t engine_block_base = block * block_stride_bytes;
+        for (size_t i = item.get_local_id(2); i < row_units; i += wg_size) {
+          const size_t head = i / head_units;
+          const size_t component_offset = (i % head_units) * sizeof(Unit);
+          size_t engine_head;
+          if constexpr (::format_facts(format).is_hnd) {
+            engine_head = head * block_size + block_token;
+          } else {
+            engine_head = block_token * num_heads + head;
+          }
+          const size_t engine_key_offset = engine_block_base +
+                                           engine_head * 2 * head_bytes +
+                                           component_offset;
+          for (size_t component = 0; component < 2; ++component) {
+            uint8_t* engine_addr =
+                engine + engine_key_offset + component * head_bytes;
+            uint8_t* lmc_addr =
+                key_value_ptr +
+                (component == 0 ? lmc_key_base : lmc_value_base) +
+                i * sizeof(Unit);
+            uint8_t* dst = D2H ? lmc_addr : engine_addr;
+            const uint8_t* src = D2H ? engine_addr : lmc_addr;
+            if ((reinterpret_cast<uintptr_t>(dst) |
+                 reinterpret_cast<uintptr_t>(src)) %
+                    alignof(Unit) ==
+                0) {
+              *reinterpret_cast<Unit*>(dst) =
+                  *reinterpret_cast<const Unit*>(src);
+            } else {
+              for (size_t byte = 0; byte < sizeof(Unit); ++byte) {
+                dst[byte] = src[byte];
+              }
+            }
+          }
+        }
+      });
+}
+
+template <typename Unit>
+void launch_multi_layer_packed(sycl::queue& queue, torch::Tensor& key_value,
+                               const torch::Tensor& key_value_ptrs,
+                               const torch::Tensor& slot_mapping,
+                               TransferDirection direction,
+                               EngineKVFormat format, int block_size,
+                               int head_size, int skip_prefix_n_tokens,
+                               int64_t block_stride_elems) {
+  auto* buffer = static_cast<uint8_t*>(key_value.data_ptr());
+  const auto* pointers =
+      static_cast<const uintptr_t*>(key_value_ptrs.data_ptr());
+  const auto* slots = slot_mapping.data_ptr<int64_t>();
+  const size_t row_bytes = key_value.size(3) * key_value.element_size();
+  const size_t head_bytes = head_size * key_value.element_size();
+  const size_t block_bytes = block_stride_elems * key_value.element_size();
+#define LAUNCH_PACKED(D2H, FORMAT)                                        \
+  submit_multi_layer_kernel_packed<Unit, D2H, FORMAT>(                    \
+      queue, buffer, pointers, slots, row_bytes, head_bytes, block_bytes, \
+      key_value.size(2), key_value.size(1), block_size, skip_prefix_n_tokens)
+  if (direction == TransferDirection::D2H) {
+    switch (format) {
+      case EngineKVFormat::NL_X_NB_BS_NH_CS:
+        LAUNCH_PACKED(true, EngineKVFormat::NL_X_NB_BS_NH_CS);
+        break;
+      case EngineKVFormat::NL_X_NB_NH_BS_CS:
+        LAUNCH_PACKED(true, EngineKVFormat::NL_X_NB_NH_BS_CS);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported packed EngineKVFormat");
+    }
+  } else {
+    switch (format) {
+      case EngineKVFormat::NL_X_NB_BS_NH_CS:
+        LAUNCH_PACKED(false, EngineKVFormat::NL_X_NB_BS_NH_CS);
+        break;
+      case EngineKVFormat::NL_X_NB_NH_BS_CS:
+        LAUNCH_PACKED(false, EngineKVFormat::NL_X_NB_NH_BS_CS);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported packed EngineKVFormat");
+    }
+  }
+#undef LAUNCH_PACKED
+}
+
 // ---------------------------------------------------------------------------
 // Macros to dispatch multi-layer kernels with a specific EngineKVFormat.
 // MLA formats (k_or_v_size==1) use the per-component kernel.
@@ -419,11 +540,82 @@ void multi_layer_kv_transfer(
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size, const int skip_prefix_n_tokens) {
-  // head_size is currently unused in the SYCL implementation; accepted to
-  // keep ABI parity with the CUDA cuda_ops binding so callers can pass the
-  // same kwargs to either backend.
-  (void)head_size;
+    const int head_size, const int skip_prefix_n_tokens,
+    const int64_t block_stride_elems) {
+  if (::is_fused_packed(engine_kv_format)) {
+    TORCH_CHECK(engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_CS ||
+                    engine_kv_format == EngineKVFormat::NL_X_NB_NH_BS_CS,
+                "Unsupported packed EngineKVFormat");
+    TORCH_CHECK(key_value.dim() == 4 && key_value.size(0) == 2 &&
+                    key_value.size(1) > 0 && key_value.size(3) > 0 &&
+                    key_value.is_contiguous(),
+                "Packed transfer requires contiguous V2 [2,L,T,NH*HS] storage");
+    TORCH_CHECK(head_size > 0 && key_value.size(3) % head_size == 0,
+                "head_size must be component HS and divide the V2 row width");
+    TORCH_CHECK(block_size > 0 && page_buffer_size > 0 &&
+                    page_buffer_size % block_size == 0,
+                "page_buffer_size must be a positive multiple of block_size");
+    TORCH_CHECK(skip_prefix_n_tokens >= 0,
+                "skip_prefix_n_tokens must be non-negative");
+    TORCH_CHECK(direction == TransferDirection::D2H ||
+                    direction == TransferDirection::H2D,
+                "Unsupported transfer direction");
+    const torch::Device transfer_device = paged_memory_device.has_index()
+                                              ? paged_memory_device
+                                              : key_value_ptrs.device();
+    TORCH_CHECK(paged_memory_device.is_xpu() && key_value_ptrs.is_xpu() &&
+                    key_value_ptrs.device() == transfer_device &&
+                    key_value_ptrs.dim() == 1 &&
+                    key_value_ptrs.is_contiguous() &&
+                    key_value_ptrs.numel() == key_value.size(1) &&
+                    (key_value_ptrs.scalar_type() == at::kLong ||
+                     key_value_ptrs.scalar_type() == at::kUInt64),
+                "Packed pointers must be a contiguous XPU int64/uint64 vector, "
+                "one per layer");
+    TORCH_CHECK(
+        slot_mapping.device() == transfer_device && slot_mapping.dim() == 1 &&
+            slot_mapping.is_contiguous() &&
+            slot_mapping.scalar_type() == at::kLong &&
+            slot_mapping.numel() == key_value.size(2),
+        "slot_mapping must be a contiguous XPU int64 vector matching T");
+    TORCH_CHECK(key_value.is_cpu() || key_value.device() == transfer_device,
+                "key_value must be pinned host memory or on the XPU device");
+    const int64_t tight_block_stride =
+        static_cast<int64_t>(block_size) * 2 * key_value.size(3);
+    TORCH_CHECK(
+        block_stride_elems == 0 || block_stride_elems >= tight_block_stride,
+        "block_stride_elems must be zero or at least a packed block");
+    const int64_t stride =
+        block_stride_elems == 0 ? tight_block_stride : block_stride_elems;
+    const c10::OptionalDeviceGuard device_guard(transfer_device);
+    sycl::queue& queue =
+        c10::xpu::getCurrentXPUStream(transfer_device.index()).queue();
+    const size_t head_bytes = head_size * key_value.element_size();
+    const size_t stride_bytes = stride * key_value.element_size();
+    const uintptr_t buffer_address =
+        reinterpret_cast<uintptr_t>(key_value.data_ptr());
+#define LAUNCH_PACKED_TRANSFER(Unit)                             \
+  launch_multi_layer_packed<Unit>(                               \
+      queue, key_value, key_value_ptrs, slot_mapping, direction, \
+      engine_kv_format, block_size, head_size, skip_prefix_n_tokens, stride)
+    if (head_bytes % 8 == 0 && stride_bytes % 8 == 0 &&
+        buffer_address % 8 == 0) {
+      LAUNCH_PACKED_TRANSFER(uint64_t);
+    } else if (head_bytes % 4 == 0 && stride_bytes % 4 == 0 &&
+               buffer_address % 4 == 0) {
+      LAUNCH_PACKED_TRANSFER(uint32_t);
+    } else if (head_bytes % 2 == 0 && stride_bytes % 2 == 0 &&
+               buffer_address % 2 == 0) {
+      LAUNCH_PACKED_TRANSFER(uint16_t);
+    } else {
+      LAUNCH_PACKED_TRANSFER(uint8_t);
+    }
+#undef LAUNCH_PACKED_TRANSFER
+    return;
+  }
+  TORCH_CHECK(block_stride_elems == 0,
+              "block_stride_elems is supported only for packed NHD/HND");
+  // Legacy/MLA callers may supply head_size for CUDA signature parity.
   int num_origin_elements = key_value.size(3);
   int copy_size = num_origin_elements * key_value.element_size();
 
