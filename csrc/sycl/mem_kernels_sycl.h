@@ -32,12 +32,34 @@ void multi_layer_block_kv_transfer(
     int lmcache_chunk_size, EngineKVFormat engine_kv_format,
     int skip_prefix_n_blocks);
 
+/**
+ * Enqueue token-slot gather/scatter on the current XPU stream.
+ *
+ * Packed NHD/HND engine rows contain each head's K followed by V. key_value
+ * retains the V2 contiguous [2, nl, tokens, nh * hs] representation, where
+ * head_size is the component hs (half the packed engine content width).
+ * key_value_ptrs and slot_mapping are contiguous XPU uint64/int64 and int64
+ * vectors. Pointers address normalized layer views, including storage offsets.
+ * An unindexed paged_memory_device uses the pointer tensor's XPU device.
+ * block_stride_elems is the physical packed-engine block stride; zero selects
+ * 2 * block_size * nh * hs. Interior block dimensions must be tightly packed.
+ *
+ * Negative slots and skip_prefix_n_tokens leave destinations untouched.
+ * key_value must be XPU or device-accessible pinned host memory; all operands
+ * must stay alive until the stream completes. Copies do not cross component
+ * boundaries and use byte copies for misaligned engine addresses.
+ *
+ * Legacy and MLA formats retain their existing addressing and ignore
+ * head_size; they require block_stride_elems == 0.
+ * Throws c10::Error for invalid packed geometry or tensor metadata.
+ */
 void multi_layer_kv_transfer(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size = 0,
-    const int head_size = 0, const int skip_prefix_n_tokens = 0);
+    const int head_size = 0, const int skip_prefix_n_tokens = 0,
+    const int64_t block_stride_elems = 0);
 
 void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
                               torch::Tensor& vllm_key_value_cache,

@@ -144,7 +144,7 @@ def CreateGPUConnector(
                 )
             else:
                 return VLLMPagedMemXPUConnectorV2.from_metadata(
-                    metadata, use_gpu, device
+                    metadata, use_gpu, device, layout_hints=layout_hints
                 )
         elif torch_device_type == "musa":
             # First Party
